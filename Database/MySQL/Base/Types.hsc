@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, EmptyDataDecls, ForeignFunctionInterface #-}
+{-# LANGUAGE DeriveDataTypeable, EmptyDataDecls, ForeignFunctionInterface, RecordWildCards #-}
 
 -- |
 -- Module:      Database.MySQL.Base.C
@@ -29,6 +29,8 @@ module Database.MySQL.Base.Types
     , MYSQL_ROWS
     , MYSQL_ROW_OFFSET
     , MyBool
+    , MYSQL_STMT
+    , MYSQL_BIND(..)
     -- * Field flags
     , hasAllFlags
     , flagNotNull
@@ -41,8 +43,12 @@ module Database.MySQL.Base.Types
     , flagAutoIncrement
     , flagNumeric
     , flagNoDefaultValue
+    , isUnsigned
     -- * Connect flags
     , toConnectFlag
+    -- * Bind types
+    , bindType
+    , bindTypeSize
     ) where
 
 #include "mysql.h"
@@ -50,14 +56,15 @@ module Database.MySQL.Base.Types
 import Control.Applicative ((<$>), (<*>), pure)
 import Data.Bits ((.|.), (.&.))
 import Data.ByteString hiding (intercalate)
-import Data.ByteString.Internal (create, memcpy)
+import Data.ByteString.Internal (create, memcpy, memset)
 import Data.List (intercalate)
 import Data.Maybe (catMaybes)
 import Data.Monoid (Monoid(..))
 import Data.Typeable (Typeable)
 import Data.Word (Word, Word8)
-import Foreign.C.Types (CChar, CInt, CUInt, CULong)
-import Foreign.Ptr (Ptr)
+import Foreign.C.Types (CChar, CInt, CUInt, CULong, CSize)
+import Foreign.Marshal (new, mallocBytes)
+import Foreign.Ptr (Ptr, castPtr)
 import Foreign.Storable (Storable(..), peekByteOff)
 import qualified Data.IntMap as IntMap
 
@@ -67,6 +74,7 @@ data MYSQL_ROWS
 type MYSQL_ROW = Ptr (Ptr CChar)
 type MYSQL_ROW_OFFSET = Ptr MYSQL_ROWS
 type MyBool = CChar
+data MYSQL_STMT
 
 -- | Column types supported by MySQL.
 data Type = Decimal
@@ -131,6 +139,73 @@ toType v = IntMap.findWithDefault oops (fromIntegral v) typeMap
                ((#const MYSQL_TYPE_STRING), String),
                ((#const MYSQL_TYPE_GEOMETRY), Geometry)
               ]
+
+data MYSQL_BIND = MYSQL_BIND
+    { bindLength       :: Ptr CULong
+    , bindIsNull       :: Ptr CChar
+    , bindBuffer       :: Ptr ()
+    , bindError        :: Ptr CChar
+    , bindBufferType   :: CInt
+    , bindBufferLength :: CULong
+    , bindIsUnsigned   :: CChar
+    }
+
+instance Storable MYSQL_BIND where
+    sizeOf _    = #{size MYSQL_BIND}
+    alignment _ = alignment (undefined :: Ptr CChar)
+    poke ptr bind@MYSQL_BIND{..} = do
+        memset (castPtr ptr) 0 (fromIntegral . sizeOf $ bind)
+        (#poke MYSQL_BIND, length)        ptr bindLength
+        (#poke MYSQL_BIND, is_null)       ptr bindIsNull
+        (#poke MYSQL_BIND, buffer)        ptr bindBuffer
+        (#poke MYSQL_BIND, error)         ptr bindError
+        (#poke MYSQL_BIND, buffer_type)   ptr bindBufferType
+        (#poke MYSQL_BIND, buffer_length) ptr bindBufferLength
+        (#poke MYSQL_BIND, is_unsigned)   ptr bindIsUnsigned
+
+isUnsigned :: FieldFlags -> Bool
+isUnsigned (FieldFlags fs) = (fs .&. #{const UNSIGNED_FLAG}) /= 0
+
+bindType :: Type -> Word -> CInt
+bindType String _ = #{const MYSQL_TYPE_VAR_STRING}
+bindType Tiny _ = #{const MYSQL_TYPE_TINY}
+bindType Short _ = #{const MYSQL_TYPE_SHORT}
+bindType Int24 _ = #{const MYSQL_TYPE_LONG}
+bindType Long _ = #{const MYSQL_TYPE_LONG}
+bindType LongLong _ = #{const MYSQL_TYPE_LONGLONG}
+bindType Float _ = #{const MYSQL_TYPE_DOUBLE}
+bindType Double _ = #{const MYSQL_TYPE_DOUBLE}
+bindType Null _ = #{const MYSQL_TYPE_NULL}
+bindType Timestamp _ = #{const MYSQL_TYPE_TIMESTAMP}
+bindType Date _ = #{const MYSQL_TYPE_DATE}
+bindType Time _ = #{const MYSQL_TYPE_TIME}
+bindType DateTime _ = #{const MYSQL_TYPE_DATETIME}
+bindType Year _ = #{const MYSQL_TYPE_LONG}
+bindType NewDate _ = #{const MYSQL_TYPE_NEWDATE}
+bindType VarChar _ = #{const MYSQL_TYPE_VAR_STRING}
+bindType Bit _ = #{const MYSQL_TYPE_BIT}
+bindType Enum _ = #{const MYSQL_TYPE_LONG}
+bindType Set _ = #{const MYSQL_TYPE_SET}
+bindType Decimal 0 = #{const MYSQL_TYPE_LONGLONG}
+bindType Decimal _ = #{const MYSQL_TYPE_DOUBLE}
+bindType NewDecimal 0 = #{const MYSQL_TYPE_LONGLONG}
+bindType NewDecimal _ = #{const MYSQL_TYPE_DOUBLE}
+bindType TinyBlob _ = #{const MYSQL_TYPE_BLOB}
+bindType MediumBlob _ = #{const MYSQL_TYPE_BLOB}
+bindType LongBlob _ = #{const MYSQL_TYPE_BLOB}
+bindType Blob _ = #{const MYSQL_TYPE_BLOB}
+bindType VarString _ = #{const MYSQL_TYPE_VAR_STRING}
+bindType Geometry _ = #{const MYSQL_TYPE_GEOMETRY}
+
+bindTypeSize :: CInt-> Word -> CULong
+bindTypeSize #{const MYSQL_TYPE_LONG} _ = 4
+bindTypeSize #{const MYSQL_TYPE_DOUBLE} _ = 8
+bindTypeSize #{const MYSQL_TYPE_DATETIME} _ = #{const sizeof(MYSQL_TIME)}
+bindTypeSize #{const MYSQL_TYPE_TIME} _ = #{const sizeof(MYSQL_TIME)}
+bindTypeSize #{const MYSQL_TYPE_NEWDATE} _ = #{const sizeof(MYSQL_TIME)}
+bindTypeSize #{const MYSQL_TYPE_DATE} _ = #{const sizeof(MYSQL_TIME)}
+bindTypeSize #{const MYSQL_TYPE_TIMESTAMP} _ = #{const sizeof(MYSQL_TIME)}
+bindTypeSize _ n = fromIntegral n
 
 -- | A description of a field (column) of a table.
 data Field = Field {

@@ -1,4 +1,4 @@
-{-# LANGUAGE DeriveDataTypeable, ForeignFunctionInterface, RecordWildCards #-}
+{-# LANGUAGE DeriveDataTypeable, RecordWildCards #-}
 
 -- |
 -- Module:      Database.MySQL.Base
@@ -26,6 +26,7 @@ module Database.MySQL.Base
     , defaultConnectInfo
     , defaultSSLInfo
     , Connection
+    , Statement
     , Result
     , Type(..)
     , Row
@@ -51,6 +52,8 @@ module Database.MySQL.Base
     , insertID
     -- ** Escaping
     , escape
+    -- ** Prepared statement
+    , prepare
     -- ** Results
     , fieldCount
     , affectedRows
@@ -75,7 +78,7 @@ module Database.MySQL.Base
     ) where
 
 import Control.Applicative ((<$>), (<*>))
-import Control.Exception (Exception, throw)
+import Control.Exception (Exception, throw, bracket)
 import Control.Monad (forM_, unless, when)
 import Data.ByteString.Char8 ()
 import Data.ByteString.Internal (ByteString, create, createAndTrim, memcpy)
@@ -88,10 +91,12 @@ import Data.Word (Word, Word16, Word64)
 import Database.MySQL.Base.C
 import Database.MySQL.Base.Types
 import Foreign.C.String (CString, peekCString, withCString)
-import Foreign.C.Types (CULong)
-import Foreign.Concurrent (newForeignPtr)
-import Foreign.ForeignPtr hiding (newForeignPtr)
-import Foreign.Marshal.Array (peekArray)
+import Foreign.C.Types (CULong, CChar)
+import Foreign.Concurrent (newForeignPtr, addForeignPtrFinalizer)
+import Foreign.ForeignPtr (finalizeForeignPtr)
+import Foreign.ForeignPtr hiding (newForeignPtr, addForeignPtrFinalizer)
+import Foreign.Marshal (new, mallocBytes, free)
+import Foreign.Marshal.Array (peekArray, withArray)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 import System.IO.Unsafe (unsafePerformIO)
 import System.Mem.Weak (Weak, deRefWeak, mkWeakPtr)
@@ -180,6 +185,10 @@ data MySQLError = ConnectionError {
       errFunction :: String
     , errNumber :: Int
     , errMessage :: String
+    } | StatementError {
+      errFunction :: String
+    , errNumber :: Int
+    , errMessage :: String
     } | ResultError {
       errFunction :: String
     , errNumber :: Int
@@ -192,8 +201,14 @@ instance Exception MySQLError
 data Connection = Connection {
       connFP :: ForeignPtr MYSQL
     , connClose :: IO ()
+    , connStmts :: IORef [Statement]
     , connResult :: IORef (Maybe (Weak Result))
     } deriving (Typeable)
+
+data Statement = Statement {
+      stmtFP :: ForeignPtr MYSQL_STMT
+    , stmtClose :: IO ()
+    }
 
 -- | Result of a database query.
 data Result = Result {
@@ -278,15 +293,18 @@ connect ConnectInfo{..} = do
                                   (fromIntegral connectPort) cpath flags
   when (ptr == nullPtr) $
     connectionError_ "connect" ptr0
+  stmts <- newIORef mempty
   res <- newIORef Nothing
   let realClose = do
         cleanupConnResult res
+        cleanupConnStmts stmts
         wasClosed <- atomicModifyIORef closed $ \prev -> (True, prev)
         unless wasClosed $ mysql_close ptr
   fp <- newForeignPtr ptr realClose
   return Connection {
                connFP = fp
              , connClose = realClose
+             , connStmts = stmts
              , connResult = res
              }
 
@@ -298,6 +316,12 @@ cleanupConnResult res = do
   case prev of
     Nothing -> return ()
     Just w -> maybe (return ()) freeResult =<< deRefWeak w
+
+cleanupConnStmts :: IORef [Statement] -> IO ()
+cleanupConnStmts stmts = do
+    prev <- readIORef stmts
+    unless (null prev) $
+        mapM_ freeStatement prev
 
 -- | Close a connection, and mark any outstanding 'Result' as
 -- invalid.
@@ -386,6 +410,75 @@ query conn q = withConn conn $ \ptr ->
 -- See <http://dev.mysql.com/doc/refman/5.5/en/mysql-insert-id.html>
 insertID :: Connection -> IO Word64
 insertID conn = fromIntegral <$> (withConn conn $ mysql_insert_id)
+
+prepare :: Connection -> ByteString -> IO Statement
+prepare conn q = withConn conn $ \mptr -> do
+    sptr <- mysql_stmt_init mptr
+    when (sptr == nullPtr) $
+        connectionError_ "prepare" mptr
+    fp <- newForeignPtr sptr (mysql_stmt_close sptr)
+    unsafeUseAsCStringLen q $ \(cq, len) -> do
+        rv <- mysql_stmt_prepare sptr cq (fromIntegral len)
+        when (rv /= 0) $
+            statementError_ "prepare" sptr
+    fields <- getResultFields sptr
+    binds <- mapM toResultBind fields
+    unless (null binds) $
+        withArray binds $ \bind -> do
+            rv <- mysql_stmt_bind_result sptr bind
+            when (rv /= 0) $
+                statementError_ "prepare" sptr
+    addForeignPtrFinalizer fp (freeBinds binds)
+    let stmt = Statement {
+              stmtFP = fp
+            , stmtClose = finalizeForeignPtr fp
+            }
+    atomicModifyIORef (connStmts conn) $ \stmts -> (stmts ++ [stmt], ())
+    return stmt
+
+getResultFields :: Ptr MYSQL_STMT -> IO [Field]
+getResultFields ptr = bracket get free conv
+  where
+    get = mysql_stmt_result_metadata ptr
+    free res
+        | res == nullPtr = return ()
+        | otherwise      = mysql_free_result res
+    conv res
+        | res == nullPtr = return []
+        | otherwise      = do
+            num <- fromIntegral <$> mysql_num_fields res
+            peekArray num =<< mysql_fetch_fields res
+
+toResultBind :: Field -> IO MYSQL_BIND
+toResultBind fld = do
+    let btype = bindType (fieldType fld) (fieldDecimals fld)
+        tsize = bindTypeSize btype (fieldLength fld)
+        unsigned = isUnsigned (fieldFlags fld)
+    size <- new tsize
+    isNull <- new (0 :: CChar)
+    error  <- new (0 :: CChar)
+    buffer <- mallocBytes (fromIntegral tsize)
+    return MYSQL_BIND
+        { bindLength       = size
+        , bindIsNull       = isNull
+        , bindError        = error
+        , bindBuffer       = buffer
+        , bindBufferType   = btype
+        , bindBufferLength = tsize
+        , bindIsUnsigned   = if unsigned then 1 else 0
+        }
+
+freeBinds :: [MYSQL_BIND] -> IO ()
+freeBinds = mapM_ freeBind
+  where
+    freeBind bind = do
+        free $ bindLength bind
+        free $ bindIsNull bind
+        free $ bindBuffer bind
+        free $ bindError bind
+
+freeStatement :: Statement -> IO ()
+freeStatement Statement{..} = stmtClose
 
 -- | Return the number of fields (columns) in a result.
 --
@@ -542,6 +635,9 @@ escape conn bs = withConn conn $ \ptr ->
 withConn :: Connection -> (Ptr MYSQL -> IO a) -> IO a
 withConn conn = withForeignPtr (connFP conn)
 
+withStmt :: Statement -> (Ptr MYSQL_STMT -> IO a) -> IO a
+withStmt stmt = withForeignPtr (stmtFP stmt)
+
 withRes :: String -> Result -> (Ptr MYSQL_RES -> IO a) -> IO a
 withRes func res act = do
   valid <- readIORef (resValid res)
@@ -564,6 +660,14 @@ checkNull :: String -> Connection -> Ptr a -> IO ()
 checkNull func conn p = when (p == nullPtr) $ connectionError func conn
 {-# INLINE checkNull #-}
 
+checkForStmt :: (Eq a, Num a) => String -> Statement -> a -> IO ()
+checkForStmt func stmt r = unless (r == 0) $ statementError func stmt
+{-# INLINE checkForStmt #-}
+
+checkNullForStmt :: String -> Statement -> Ptr a -> IO ()
+checkNullForStmt func stmt p = unless (p == nullPtr) $ statementError func stmt
+{-# INLINE checkNullForStmt #-}
+
 withPtr :: (Ptr a -> IO b) -> Ptr a -> IO (Maybe b)
 withPtr act p | p == nullPtr = return Nothing
               | otherwise    = Just <$> act p
@@ -576,3 +680,12 @@ connectionError_ func ptr =do
   errno <- mysql_errno ptr
   msg <- peekCString =<< mysql_error ptr
   throw $ ConnectionError func (fromIntegral errno) msg
+
+statementError :: String -> Statement -> IO a
+statementError func stmt = withStmt stmt $ statementError_ func
+
+statementError_ :: String -> Ptr MYSQL_STMT -> IO a
+statementError_ func ptr = do
+  errno <- mysql_stmt_errno ptr
+  msg   <- peekCString =<< mysql_stmt_error ptr
+  throw $ StatementError func (fromIntegral errno) msg

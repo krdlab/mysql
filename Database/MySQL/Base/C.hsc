@@ -35,8 +35,17 @@ module Database.MySQL.Base.C
     , mysql_insert_id
     -- ** Escaping
     , mysql_real_escape_string
+    -- ** Prepared statements
+    , mysql_stmt_init
+    , mysql_stmt_close
+    , mysql_stmt_errno
+    , mysql_stmt_error
+    , mysql_stmt_prepare
+    , mysql_stmt_result_metadata
+    , mysql_stmt_bind_result
     -- ** Results
     , mysql_field_count
+    , mysql_num_fields
     , mysql_affected_rows
     , mysql_store_result
     , mysql_use_result
@@ -277,3 +286,27 @@ foreign import ccall safe mysql_errno
 
 foreign import ccall safe mysql_error
     :: Ptr MYSQL -> IO CString
+
+foreign import ccall unsafe mysql_stmt_init
+    :: Ptr MYSQL -> IO (Ptr MYSQL_STMT)
+
+foreign import ccall unsafe mysql_stmt_close
+    :: Ptr MYSQL_STMT -> IO ()
+
+foreign import ccall unsafe mysql_stmt_prepare
+    :: Ptr MYSQL_STMT -> CString -> CInt -> IO CInt
+
+foreign import ccall unsafe mysql_stmt_bind_result
+    :: Ptr MYSQL_STMT -> Ptr MYSQL_BIND -> IO CChar
+
+foreign import ccall unsafe mysql_stmt_result_metadata
+    :: Ptr MYSQL_STMT -> IO (Ptr MYSQL_RES)
+
+foreign import ccall unsafe mysql_num_fields
+    :: Ptr MYSQL_RES -> IO CUInt
+
+foreign import ccall unsafe mysql_stmt_errno
+    :: Ptr MYSQL_STMT -> IO CInt
+
+foreign import ccall unsafe mysql_stmt_error
+    :: Ptr MYSQL_STMT -> IO CString
